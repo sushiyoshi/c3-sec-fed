@@ -2,7 +2,7 @@ import argparse
 import copy
 import os
 import random
-from dataclasses import dataclass
+import time
 from typing import Dict, List, Sequence, Tuple
 
 import numpy as np
@@ -11,6 +11,14 @@ import torch.nn as nn
 import torch.optim as optim
 from torch.utils.data import DataLoader, Subset
 from torchvision import datasets, transforms
+
+from fedavg_core import (
+    Aggregator,
+    ClientUpdateResult,
+    CKKSAggregator,
+    PlaintextAggregator,
+    TFHEAggregator,
+)
 
 
 def set_seed(seed: int) -> None:
@@ -55,14 +63,6 @@ class SimpleCIFARNet(nn.Module):
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         x = self.features(x)
         return self.classifier(x)
-
-
-@dataclass
-class ClientUpdateResult:
-    state_dict: Dict[str, torch.Tensor]
-    num_samples: int
-    loss: float
-
 
 def build_transforms() -> Tuple[transforms.Compose, transforms.Compose]:
     train_transform = transforms.Compose(
@@ -121,15 +121,26 @@ def build_client_loaders(
     iid: bool,
     alpha: float,
     seed: int,
+    max_examples_per_client: int | None = None,
 ) -> List[DataLoader]:
     indices = list(range(len(dataset)))
     if iid:
         partitions = iid_partition(indices, num_clients, seed)
     else:
-        partitions = dirichlet_partition(dataset.targets, num_clients, alpha, seed)
+        labels_source = None
+        if hasattr(dataset, "targets"):
+            labels_source = dataset.targets
+        elif hasattr(dataset, "labels"):
+            labels_source = dataset.labels
+        if labels_source is None:
+            rng = np.random.default_rng(seed)
+            labels_source = rng.integers(low=0, high=10, size=len(dataset))
+        partitions = dirichlet_partition(labels_source, num_clients, alpha, seed)
 
     client_loaders: List[DataLoader] = []
     for partition in partitions:
+        if max_examples_per_client is not None:
+            partition = partition[:max_examples_per_client]
         subset = Subset(dataset, partition)
         loader = DataLoader(
             subset,
@@ -166,25 +177,6 @@ def evaluate(
     avg_loss = total_loss / total_examples
     accuracy = total_correct / total_examples
     return avg_loss, accuracy
-
-
-def average_state_dicts(
-    global_state: Dict[str, torch.Tensor],
-    client_states: Sequence[ClientUpdateResult],
-) -> Dict[str, torch.Tensor]:
-    total_samples = sum(client.num_samples for client in client_states)
-    if total_samples == 0:
-        raise ValueError("Total number of samples across participating clients is zero.")
-
-    averaged_state = {
-        key: torch.zeros_like(val, device=torch.device("cpu"))
-        for key, val in global_state.items()
-    }
-    for client in client_states:
-        weight = client.num_samples / total_samples
-        for key in averaged_state:
-            averaged_state[key] += client.state_dict[key] * weight
-    return averaged_state
 
 
 def local_update(
@@ -230,20 +222,53 @@ def local_update(
     return ClientUpdateResult(cpu_state, total_samples, avg_loss)
 
 
-def run_federated_training(args: argparse.Namespace) -> None:
+def build_aggregator(args: argparse.Namespace) -> Aggregator:
+    mode = args.aggregation_mode.lower()
+    if mode == "plaintext":
+        return PlaintextAggregator()
+    if mode == "tfhe":
+        return TFHEAggregator(
+            default_scale=args.tfhe_scaling,
+            max_bit_width=args.tfhe_bit_width,
+        )
+    if mode == "ckks":
+        return CKKSAggregator(
+            batch_size=args.ckks_batch_size,
+            multiplicative_depth=args.ckks_depth,
+            scaling_mod_size=args.ckks_scaling_mod_size,
+        )
+    raise ValueError(f"Unsupported aggregation mode: {args.aggregation_mode}")
+
+
+def run_federated_training(args: argparse.Namespace) -> Dict[str, List[float]]:
     set_seed(args.seed)
     device = torch.device(args.device) if args.device else torch.device(
         "cuda" if torch.cuda.is_available() else "cpu"
     )
-    print(f"Using device: {device}")
+    if not args.quiet:
+        print(f"Using device: {device}")
 
     train_transform, test_transform = build_transforms()
-    train_dataset = datasets.CIFAR10(
-        args.data_dir, train=True, download=True, transform=train_transform
-    )
-    test_dataset = datasets.CIFAR10(
-        args.data_dir, train=False, download=True, transform=test_transform
-    )
+    if getattr(args, "use_fake_data", False):
+        train_dataset = datasets.FakeData(
+            size=args.fake_train_size,
+            image_size=(3, 32, 32),
+            num_classes=10,
+            transform=train_transform,
+        )
+        test_dataset = datasets.FakeData(
+            size=args.fake_test_size,
+            image_size=(3, 32, 32),
+            num_classes=10,
+            transform=test_transform,
+        )
+    else:
+        train_dataset = datasets.CIFAR10(
+            args.data_dir, train=True, download=True, transform=train_transform
+        )
+        test_dataset = datasets.CIFAR10(
+            args.data_dir, train=False, download=True, transform=test_transform
+        )
 
     client_loaders = build_client_loaders(
         train_dataset,
@@ -252,6 +277,7 @@ def run_federated_training(args: argparse.Namespace) -> None:
         iid=args.iid,
         alpha=args.alpha,
         seed=args.seed,
+        max_examples_per_client=args.max_examples_per_client,
     )
     test_loader = DataLoader(
         test_dataset,
@@ -267,13 +293,16 @@ def run_federated_training(args: argparse.Namespace) -> None:
     }
     loss_fn = nn.CrossEntropyLoss()
 
+    aggregator = build_aggregator(args)
+
     clients_per_round = (
         args.clients_per_round if args.clients_per_round else args.clients
     )
     clients_per_round = min(clients_per_round, args.clients)
 
-    history = {"round": [], "test_loss": [], "test_accuracy": []}
+    history = {"round": [], "test_loss": [], "test_accuracy": [], "round_duration": []}
     for round_idx in range(1, args.rounds + 1):
+        round_start = time.perf_counter()
         participating_clients = random.sample(
             range(args.clients), clients_per_round
         )
@@ -295,7 +324,7 @@ def run_federated_training(args: argparse.Namespace) -> None:
             client_updates.append(update)
             round_losses.append(update.loss)
 
-        global_state = average_state_dicts(global_state, client_updates)
+        global_state = aggregator.aggregate(global_state, client_updates)
         global_model.load_state_dict(global_state)
         test_loss, test_accuracy = evaluate(
             global_model, test_loader, device, loss_fn
@@ -304,23 +333,28 @@ def run_federated_training(args: argparse.Namespace) -> None:
         history["round"].append(round_idx)
         history["test_loss"].append(test_loss)
         history["test_accuracy"].append(test_accuracy)
+        history["round_duration"].append(time.perf_counter() - round_start)
 
         avg_client_loss = sum(round_losses) / max(len(round_losses), 1)
-        print(
-            f"Round {round_idx:03d}: "
-            f"participating clients={len(participating_clients)}, "
-            f"client_loss={avg_client_loss:.4f}, "
-            f"test_loss={test_loss:.4f}, "
-            f"test_accuracy={test_accuracy * 100:.2f}%"
-        )
+        if not args.quiet:
+            print(
+                f"Round {round_idx:03d}: "
+                f"participating clients={len(participating_clients)}, "
+                f"client_loss={avg_client_loss:.4f}, "
+                f"test_loss={test_loss:.4f}, "
+                f"test_accuracy={test_accuracy * 100:.2f}%"
+            )
 
-    print("Training complete.")
+    if not args.quiet:
+        print("Training complete.")
     best_accuracy = max(history["test_accuracy"])
     best_round = history["test_accuracy"].index(best_accuracy) + 1
-    print(
-        f"Best accuracy: {best_accuracy * 100:.2f}% at round {best_round} "
-        f"out of {args.rounds} rounds."
-    )
+    if not args.quiet:
+        print(
+            f"Best accuracy: {best_accuracy * 100:.2f}% at round {best_round} "
+            f"out of {args.rounds} rounds."
+        )
+    return history
 
 
 def parse_args() -> argparse.Namespace:
@@ -350,6 +384,12 @@ def parse_args() -> argparse.Namespace:
         help="Weight decay for SGD optimizer.",
     )
     parser.add_argument(
+        "--max-examples-per-client",
+        type=int,
+        default=None,
+        help="Optional cap on the number of training samples assigned to each client.",
+    )
+    parser.add_argument(
         "--iid",
         action="store_true",
         help="Use IID data partitioning instead of Dirichlet distribution.",
@@ -374,6 +414,67 @@ def parse_args() -> argparse.Namespace:
         type=str,
         default=None,
         help="Compute device (e.g. 'cuda', 'cpu'). Defaults to CUDA when available.",
+    )
+    parser.add_argument(
+        "--aggregation-mode",
+        type=str,
+        default="plaintext",
+        choices=["plaintext", "tfhe", "ckks"],
+        help="Averaging mode to use for server-side aggregation.",
+    )
+    parser.add_argument(
+        "--use-fake-data",
+        action="store_true",
+        help="Use synthetic CIFAR-like data instead of downloading the real dataset.",
+    )
+    parser.add_argument(
+        "--fake-train-size",
+        type=int,
+        default=1024,
+        help="Number of synthetic training examples when --use-fake-data is set.",
+    )
+    parser.add_argument(
+        "--fake-test-size",
+        type=int,
+        default=256,
+        help="Number of synthetic test examples when --use-fake-data is set.",
+    )
+    parser.add_argument(
+        "--tfhe-bit-width",
+        type=int,
+        default=16,
+        dest="tfhe_bit_width",
+        help="Maximum ciphertext bit-width used when quantizing TFHE ciphertexts.",
+    )
+    parser.add_argument(
+        "--tfhe-scaling",
+        type=float,
+        default=2**15,
+        dest="tfhe_scaling",
+        help="Default floating-point scaling factor before TFHE encryption.",
+    )
+    parser.add_argument(
+        "--ckks-batch-size",
+        type=int,
+        default=8192,
+        help="Number of packed slots for CKKS plaintexts.",
+    )
+    parser.add_argument(
+        "--ckks-depth",
+        type=int,
+        default=2,
+        help="Multiplicative depth for the CKKS crypto context.",
+    )
+    parser.add_argument(
+        "--ckks-scaling-mod-size",
+        type=int,
+        default=59,
+        help="Scaling modulus size used when generating the CKKS context.",
+    )
+    parser.add_argument(
+        "--quiet",
+        action="store_true",
+        help="Suppress per-round logging (useful for benchmarking).",
     )
     return parser.parse_args()
 
