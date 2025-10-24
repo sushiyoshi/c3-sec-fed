@@ -176,14 +176,21 @@ def average_state_dicts(
     if total_samples == 0:
         raise ValueError("Total number of samples across participating clients is zero.")
 
-    averaged_state = {
-        key: torch.zeros_like(val, device=torch.device("cpu"))
-        for key, val in global_state.items()
-    }
+    averaged_state = {}
+    for key, val in global_state.items():
+        # Skip averaging for integer buffers like num_batches_tracked
+        if val.dtype in [torch.int32, torch.int64, torch.long]:
+            averaged_state[key] = val.clone()
+        else:
+            averaged_state[key] = torch.zeros_like(val, device=torch.device("cpu"))
+
     for client in client_states:
         weight = client.num_samples / total_samples
         for key in averaged_state:
-            averaged_state[key] += client.state_dict[key] * weight
+            # Only average non-integer tensors
+            if averaged_state[key].dtype not in [torch.int32, torch.int64, torch.long]:
+                averaged_state[key] += client.state_dict[key] * weight
+
     return averaged_state
 
 
