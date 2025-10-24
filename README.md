@@ -1,6 +1,6 @@
-# Federated Learning on CIFAR-10
+# Federated Learning with CKKS Homomorphic Encryption
 
-This project provides a minimal implementation of the Federated Averaging (FedAvg) algorithm on the CIFAR-10 image classification dataset using PyTorch.
+CIFAR-10での連合学習とCKKS準同型暗号を使用したセキュア連合学習の比較実装。
 
 ## Setup
 
@@ -10,28 +10,32 @@ source .venv/bin/activate
 pip install -r requirements.txt
 ```
 
+OpenFHE-Pythonのインストールが必要:
+```bash
+git clone https://github.com/openfheorg/openfhe-python.git
+cd openfhe-python
+# インストール手順はopenfhe-pythonのREADMEを参照
+```
+
 ## Usage
 
-Run federated training with default parameters:
-
+### 平文とCKKS暗号化の連合学習比較
 ```bash
-python federated_cifar10.py
+python federated.py --clients 5 --rounds 5
 ```
 
-Useful options:
-
-- `--rounds`: number of global aggregation rounds (default: 20)
-- `--clients`: total number of simulated clients (default: 10)
-- `--clients-per-round`: clients sampled in each round (default: all)
-- `--local-epochs`: local epochs per client per round (default: 1)
-- `--iid`: use IID data split instead of the default Dirichlet non-IID split
-- `--alpha`: Dirichlet concentration for non-IID split (default: 0.5)
-- `--device`: force computation device, e.g. `cuda` or `cpu`
-
-Example for a quick smoke test with fewer rounds and clients:
-
+### 基本的な連合学習（平文のみ）
 ```bash
-python federated_cifar10.py --rounds 2 --clients 4 --clients-per-round 2 --local-epochs 1
+python federated_cifar10.py --rounds 20 --clients 10
 ```
 
-The script downloads CIFAR-10 on the first run (into `./data` by default), performs federated training, and prints round-by-round metrics together with the best test accuracy observed.
+### CKKSテスト
+```bash
+python ckks_chebyshev.py
+```
+
+## Files
+
+- `federated.py`: CKKS準同型暗号を使用したセキュア連合学習の実装
+- `federated_cifar10.py`: 平文での基本的な連合学習実装
+- `ckks_chebyshev.py`: OpenFHE CKKSのブートストラッピングテスト
