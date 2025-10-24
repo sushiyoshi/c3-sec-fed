@@ -226,42 +226,48 @@ class FHEModelAggregator:
 
         return encrypted_weights
 
-    def aggregate_encrypted_models(self, client_weights_list):
+    def aggregate_encrypted_models(self, client_weights_list, client_sample_counts):
         """
-        複数クライアントの重みを暗号化したまま平均化する（コアロジック）
+        複数クライアントの重みを暗号化したまま加重平均する（コアロジック）
 
         【処理の流れ】
         1. 各クライアントの重みを暗号化
-        2. レイヤごと、チャンクごとに暗号文を加算（EvalAdd）
-        3. 1/N を乗算して平均化（EvalMult）
-        4. 復号して元のテンソル形状に戻す
+        2. レイヤごと、チャンクごとに暗号文を加重加算（EvalAdd + EvalMult）
+        3. 復号して元のテンソル形状に戻す
 
         【重要なポイント】
         - 暗号文のまま加算・乗算を行うため、サーバは平文の重みを見ることができない
         - これによりクライアントのプライバシーが保護される
+        - 各クライアントのデータ量に応じた加重平均を実現
 
         Args:
             client_weights_list: 各クライアントのstate_dictのリスト
+            client_sample_counts: 各クライアントのサンプル数のリスト
 
         Returns:
-            aggregated_weights: 平均化されたstate_dict（PyTorchテンソル）
+            aggregated_weights: 加重平均されたstate_dict（PyTorchテンソル）
         """
-        print("\n🔒 Starting CKKS model aggregation...")
+        print("\n🔒 Starting CKKS model aggregation with weighted averaging...")
 
         # ========================================
         # ステップ1: 全クライアントの重みを暗号化
         # ========================================
         encrypted_weights_list = []
         for i, client_state_dict in enumerate(client_weights_list):
-            print(f"  🔑 Encrypting weights from Client {i+1}...")
+            print(f"  🔑 Encrypting weights from Client {i+1} (samples: {client_sample_counts[i]})...")
             enc = self.encrypt_model_weights(client_state_dict)
             encrypted_weights_list.append(enc)
 
         # ========================================
-        # ステップ2: レイヤごとに暗号化されたまま集約
+        # ステップ2: レイヤごとに暗号化されたまま加重集約
         # ========================================
         aggregated_weights = {}
-        inv_n = 1.0 / len(encrypted_weights_list)  # 平均化のための係数 (1/N)
+
+        # 総サンプル数を計算
+        total_samples = sum(client_sample_counts)
+        # 各クライアントの重み（加重係数）を計算
+        weights = [count / total_samples for count in client_sample_counts]
+        print(f"  📊 Total samples: {total_samples}, Weights: {[f'{w:.4f}' for w in weights]}")
 
         # バッファ（BatchNormの統計量など）は暗号化せず、最初のクライアントのものを使用
         for buffer_name in self.buffer_names:
@@ -280,20 +286,18 @@ class FHEModelAggregator:
                 # 各クライアントの同じチャンクの暗号文を収集
                 chunk_cts = [client_cts[chunk_idx] for client_cts in layer_cts_list]
 
-                # ========== 準同型加算 ==========
-                # 暗号文のまま加算（N個のクライアントの重みを合計）
-                c_sum = chunk_cts[0]
-                for ct in chunk_cts[1:]:
-                    c_sum = self.cc.EvalAdd(c_sum, ct)
-
-                # ========== 準同型乗算 ==========
-                # 合計を平均化するため、平文定数 1/N を乗算
-                # この操作も暗号文のまま実行される
-                c_avg = self.cc.EvalMult(c_sum, inv_n)
+                # ========== 準同型加重加算 ==========
+                # 暗号文のまま加重加算（各クライアントの重みに加重係数を乗算してから加算）
+                # 最初のクライアントの暗号文に重みを乗算
+                c_weighted_sum = self.cc.EvalMult(chunk_cts[0], weights[0])
+                # 残りのクライアントの暗号文に重みを乗算して加算
+                for i, ct in enumerate(chunk_cts[1:], start=1):
+                    c_weighted = self.cc.EvalMult(ct, weights[i])
+                    c_weighted_sum = self.cc.EvalAdd(c_weighted_sum, c_weighted)
 
                 # ========== 復号 ==========
-                # 秘密鍵で復号して平文の平均値を取得
-                pt_avg = self.cc.Decrypt(c_avg, self.keys.secretKey)
+                # 秘密鍵で復号して平文の加重平均値を取得
+                pt_avg = self.cc.Decrypt(c_weighted_sum, self.keys.secretKey)
                 pt_avg.SetLength(self.batch_size)
                 vals = pt_avg.GetRealPackedValue()  # パックされた値を展開
                 all_vals.extend(vals)
@@ -305,7 +309,7 @@ class FHEModelAggregator:
 
             print(f"  ✅ Aggregated {layer_name} ({num_chunks} chunks) with {len(layer_cts_list)} clients")
 
-        print("✅ CKKS model aggregation completed!")
+        print("✅ CKKS model aggregation completed with weighted averaging!")
         return aggregated_weights
 
 
@@ -652,15 +656,18 @@ class FHEServer:
 
     def aggregate_models_with_fhe(self, client_updates):
         """
-        CKKS でクライアント重みを平均し、グローバルへ適用。
+        CKKS でクライアント重みを加重平均し、グローバルへ適用。
         client_updates: list of (state_dict, num_samples) tuples
         """
         print("🔒 FHE-based model aggregation (OpenFHE CKKS)...")
-        # state_dictのみを抽出
+        # state_dictとサンプル数を分離
         client_weights_list = [state_dict for state_dict, _ in client_updates]
-        aggregated_weights = self.fhe_aggregator.aggregate_encrypted_models(client_weights_list)
+        client_sample_counts = [num_samples for _, num_samples in client_updates]
+        aggregated_weights = self.fhe_aggregator.aggregate_encrypted_models(
+            client_weights_list, client_sample_counts
+        )
         self.global_model.load_state_dict(aggregated_weights)
-        print("🔒 FHE Global model updated")
+        print("🔒 FHE Global model updated with weighted averaging")
 
     def get_global_weights(self):
         """クライアントに配布するためのグローバル重みを返す"""
