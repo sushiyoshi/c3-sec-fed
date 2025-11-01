@@ -99,20 +99,18 @@ class FHEModelAggregator:
         # ========================================
         # ステップ1: モデル構造の解析
         # ========================================
-        # モデルから学習可能なパラメータ（重み）の形状を取得
-        # 例: conv1.weight → (32, 3, 3, 3) のような形状情報を保存
-        self.weight_shapes = {}
-        self.buffer_names = set()
+        # モデルから「浮動小数のみ」の形状を収集（パラメータ＋BN等のfloatバッファ）
+        self.weight_shapes = {}  # name -> torch.Size
         max_elems = 0  # 最大要素数を記録（バッチサイズ決定に使用）
 
         for name, param in model_structure.named_parameters():
             self.weight_shapes[name] = param.shape
             max_elems = max(max_elems, int(np.prod(param.shape)))
 
-        # バッファ（BatchNormの統計量など）は暗号化せず平文で扱う
-        # running_mean, running_var, num_batches_tracked などが該当
         for name, buffer in model_structure.named_buffers():
-            self.buffer_names.add(name)
+            if hasattr(buffer, "dtype") and buffer.dtype.is_floating_point:
+                self.weight_shapes[name] = buffer.shape
+                max_elems = max(max_elems, int(np.prod(buffer.shape)))
 
         # ========================================
         # ステップ2: CKKS暗号パラメータの設定
@@ -143,174 +141,76 @@ class FHEModelAggregator:
         # 実際に使用するバッチサイズで暗号コンテキストを作成
         params.SetBatchSize(self.batch_size)
         self.cc = GenCryptoContext(params)
+        # 必要な機能のみ有効化（定数乗算＋加算のみ）
+        self.cc.Enable(PKESchemeFeature.PKE)
+        self.cc.Enable(PKESchemeFeature.LEVELEDSHE)
 
-        # 必要な暗号機能を有効化
-        self.cc.Enable(PKESchemeFeature.PKE)           # 公開鍵暗号化
-        self.cc.Enable(PKESchemeFeature.KEYSWITCH)     # 鍵切り替え
-        self.cc.Enable(PKESchemeFeature.LEVELEDSHE)    # レベル付き準同型暗号
-
-        # 公開鍵と秘密鍵のペアを生成
+        # 鍵生成（EvalMultKeyGen は使わない）
         self.keys = self.cc.KeyGen()
-        # 乗算用の評価鍵を生成（平文定数との乗算に使用）
-        self.cc.EvalMultKeyGen(self.keys.secretKey)
 
         print(f"🔐 CKKS ready: ring dimension = {self.cc.GetRingDimension()}, batch_size = {self.batch_size}")
 
-        # 以前の Concrete-ML 回路置き場はダミーで残す（外部参照されないが互換のため）
+        self.decrypt_calls = 0
+        # 互換ダミー（未使用）
         self.circuits = {}
 
-    # [REPLACED] Concrete-ML の回路コンパイルは削除（互換のため空メソッドは残さない）
+    def get_public_key(self):
+        """クライアント暗号化用の公開鍵を返す。"""
+        return self.keys.publicKey
 
-    def _split_into_chunks(self, tensor: torch.Tensor, chunk_size: int):
+    # （サーバ側暗号化APIは廃止：クライアント側で暗号化する）
+
+    def aggregate_encrypted_models(self, enc_payloads):
         """
-        テンソルをチャンクに分割（CKKS暗号化のため）
+        クライアント側で暗号化された重みを暗号領域のまま加重平均し、復号して返す。
 
-        大きなテンソルは一つの暗号文に収まらないため、
-        batch_size単位で分割して複数の暗号文として扱う
-
-        Args:
-            tensor: 分割するテンソル（モデルの重み）
-            chunk_size: 1チャンクあたりの要素数（=batch_size）
+        enc_payloads: List of tuples (encrypted_state_dict, int_buffers_plain, sample_count)
+                      encrypted_state_dict: {name: [Ciphertext,...]}  ※float項目のみ
+                      int_buffers_plain: {name: torch.Tensor(int系)}   ※先頭クライアントを採用
 
         Returns:
-            chunks: チャンクのリスト（最後のチャンクは0でパディング）
+            aggregated_weights: {name: torch.Tensor(float32)}（floatパラメータ＋floatバッファ）
+            first_int_buffers:  {name: torch.Tensor(int)}（整数バッファはコピー）
         """
-        # テンソルを1次元配列に平坦化してリストに変換
-        flat = tensor.detach().cpu().float().numpy().reshape(-1).tolist()
-        chunks = []
+        print("\n🔒 Starting CKKS model aggregation (client-side encryption)...")
+        self.decrypt_calls = 0
+        total_samples = sum(n for _, __, n in enc_payloads)
+        weights = [n / total_samples for _, __, n in enc_payloads]
+        num_clients = len(enc_payloads)
 
-        # chunk_sizeごとに分割
-        for i in range(0, len(flat), chunk_size):
-            chunk = flat[i:i+chunk_size]
-            # 最後のチャンクがchunk_sizeより小さい場合は0でパディング
-            if len(chunk) < chunk_size:
-                chunk = chunk + [0.0] * (chunk_size - len(chunk))
-            chunks.append(chunk)
-        return chunks
-
-    def encrypt_model_weights(self, model_weights_dict):
-        """
-        クライアントのモデル重みをCKKS暗号化する
-
-        【処理の流れ】
-        1. 各レイヤの重みテンソルをチャンクに分割
-        2. 各チャンクをCKKS平文（Plaintext）に変換
-        3. 公開鍵で暗号化して暗号文（Ciphertext）を生成
-
-        Args:
-            model_weights_dict: モデルの重み辞書 {layer_name: tensor}
-
-        Returns:
-            encrypted_weights: 暗号化された重み {layer_name: [Ciphertext, ...]}
-                              大きなレイヤーは複数の暗号文に分割される
-        """
-        encrypted_weights = {}
-
-        # レイヤごとに処理
-        for layer_name, shape in self.weight_shapes.items():
-            w_tensor: torch.Tensor = model_weights_dict[layer_name]
-
-            # テンソルをbatch_size単位のチャンクに分割
-            chunks = self._split_into_chunks(w_tensor, self.batch_size)
-
-            # 各チャンクを暗号化
-            cts = []
-            for chunk in chunks:
-                # CKKS平文オブジェクトを作成（複数の値をパック）
-                pt = self.cc.MakeCKKSPackedPlaintext(chunk)
-                # 公開鍵で暗号化
-                ct = self.cc.Encrypt(self.keys.publicKey, pt)
-                cts.append(ct)
-
-            encrypted_weights[layer_name] = cts
-
-        return encrypted_weights
-
-    def aggregate_encrypted_models(self, client_weights_list, client_sample_counts):
-        """
-        複数クライアントの重みを暗号化したまま加重平均する（コアロジック）
-
-        【処理の流れ】
-        1. 各クライアントの重みを暗号化
-        2. レイヤごと、チャンクごとに暗号文を加重加算（EvalAdd + EvalMult）
-        3. 復号して元のテンソル形状に戻す
-
-        【重要なポイント】
-        - 暗号文のまま加算・乗算を行うため、サーバは平文の重みを見ることができない
-        - これによりクライアントのプライバシーが保護される
-        - 各クライアントのデータ量に応じた加重平均を実現
-
-        Args:
-            client_weights_list: 各クライアントのstate_dictのリスト
-            client_sample_counts: 各クライアントのサンプル数のリスト
-
-        Returns:
-            aggregated_weights: 加重平均されたstate_dict（PyTorchテンソル）
-        """
-        print("\n🔒 Starting CKKS model aggregation with weighted averaging...")
-
-        # ========================================
-        # ステップ1: 全クライアントの重みを暗号化
-        # ========================================
-        encrypted_weights_list = []
-        for i, client_state_dict in enumerate(client_weights_list):
-            print(f"  🔑 Encrypting weights from Client {i+1} (samples: {client_sample_counts[i]})...")
-            enc = self.encrypt_model_weights(client_state_dict)
-            encrypted_weights_list.append(enc)
-
-        # ========================================
-        # ステップ2: レイヤごとに暗号化されたまま加重集約
-        # ========================================
         aggregated_weights = {}
+        # 整数バッファは先頭クライアントのものをコピー（要件）
+        first_int_buffers = enc_payloads[0][1]
 
-        # 総サンプル数を計算
-        total_samples = sum(client_sample_counts)
-        # 各クライアントの重み（加重係数）を計算
-        weights = [count / total_samples for count in client_sample_counts]
-        print(f"  📊 Total samples: {total_samples}, Weights: {[f'{w:.4f}' for w in weights]}")
-
-        # バッファ（BatchNormの統計量など）は暗号化せず、最初のクライアントのものを使用
-        for buffer_name in self.buffer_names:
-            if buffer_name in client_weights_list[0]:
-                aggregated_weights[buffer_name] = client_weights_list[0][buffer_name].clone()
-
-        # 各レイヤの重みを集約
-        for layer_name, shape in self.weight_shapes.items():
-            # 全クライアントの同じレイヤの暗号文リストを収集
-            layer_cts_list = [enc[layer_name] for enc in encrypted_weights_list]
-            num_chunks = len(layer_cts_list[0])  # このレイヤのチャンク数
-
-            # チャンクごとに集約処理
-            all_vals = []
-            for chunk_idx in range(num_chunks):
-                # 各クライアントの同じチャンクの暗号文を収集
-                chunk_cts = [client_cts[chunk_idx] for client_cts in layer_cts_list]
-
-                # ========== 準同型加重加算 ==========
-                # 暗号文のまま加重加算（各クライアントの重みに加重係数を乗算してから加算）
-                # 最初のクライアントの暗号文に重みを乗算
-                c_weighted_sum = self.cc.EvalMult(chunk_cts[0], weights[0])
-                # 残りのクライアントの暗号文に重みを乗算して加算
-                for i, ct in enumerate(chunk_cts[1:], start=1):
-                    c_weighted = self.cc.EvalMult(ct, weights[i])
-                    c_weighted_sum = self.cc.EvalAdd(c_weighted_sum, c_weighted)
-
-                # ========== 復号 ==========
-                # 秘密鍵で復号して平文の加重平均値を取得
-                pt_avg = self.cc.Decrypt(c_weighted_sum, self.keys.secretKey)
-                pt_avg.SetLength(self.batch_size)
-                vals = pt_avg.GetRealPackedValue()  # パックされた値を展開
-                all_vals.extend(vals)
-
-            # パディングを除去して元の形状に復元
+        for name, shape in self.weight_shapes.items():
             num_elems = int(np.prod(shape))
-            trimmed = np.array(all_vals[:num_elems], dtype=np.float32).reshape(shape)
-            aggregated_weights[layer_name] = torch.from_numpy(trimmed)
+            num_chunks = ceil(num_elems / self.batch_size)
 
-            print(f"  ✅ Aggregated {layer_name} ({num_chunks} chunks) with {len(layer_cts_list)} clients")
+            flat_vals = []
+            for chunk_idx in range(num_chunks):
+                c_sum = None
+                for ci in range(num_clients):
+                    enc_state = enc_payloads[ci][0]
+                    w_i = weights[ci]
+                    ct = enc_state[name][chunk_idx]
+                    pt_w = self.cc.MakeCKKSPackedPlaintext([w_i] * self.batch_size)
+                    term = self.cc.EvalMult(ct, pt_w)
+                    c_sum = term if c_sum is None else self.cc.EvalAdd(c_sum, term)
 
-        print("✅ CKKS model aggregation completed with weighted averaging!")
-        return aggregated_weights
+                pt = self.cc.Decrypt(self.keys.secretKey, c_sum)
+                pt.SetLength(self.batch_size)
+                vals = getattr(pt, "GetRealPackedValue", pt.GetCKKSPackedValue)()
+                flat_vals.extend(vals)
+                self.decrypt_calls += 1
+
+            trimmed = np.array(flat_vals[:num_elems], dtype=np.float32).reshape(tuple(shape))
+            aggregated_weights[name] = torch.from_numpy(trimmed)
+
+        # 期待復号回数チェック（per-chunk）
+        expected = sum(ceil(int(np.prod(s)) / self.batch_size) for s in self.weight_shapes.values())
+        assert self.decrypt_calls == expected, f"decrypt_calls={self.decrypt_calls} != expected={expected}"
+        print(f"[CKKS] decrypt_calls={self.decrypt_calls} (per-chunk)")
+        return aggregated_weights, first_int_buffers
 
 
 # =========================================================
@@ -530,6 +430,10 @@ class Client:
         self.lr = lr  # 学習率
         self.momentum = momentum  # SGDのモーメンタム
         self.weight_decay = weight_decay  # 重み減衰（正則化）
+        # 暗号化用の直近状態
+        self.last_state_floats = None   # {name: Tensor(float)}
+        self.last_int_buffers = None    # {name: Tensor(int)}
+        self.local_sample_count = 0
 
     def local_update(self, global_weights, epochs=1):
         """
@@ -592,9 +496,33 @@ class Client:
         avg_loss = total_loss / max(total_samples, 1)
         print(f"Client {self.client_id}: Completed training with loss={avg_loss:.4f}")
 
-        # 学習後の重みをCPUに移動して返す（サーバへ送信するため）
-        cpu_state = {key: value.detach().cpu() for key, value in model.state_dict().items()}
+        # 学習後の重みをCPUへ
+        cpu_state = {k: v.detach().cpu() for k, v in model.state_dict().items()}
+        # 浮動小数項目と整数バッファを分離保存（暗号化/コピー方針）
+        self.last_state_floats = {k: t for k, t in cpu_state.items() if t.dtype.is_floating_point}
+        self.last_int_buffers  = {k: t for k, t in cpu_state.items() if not t.dtype.is_floating_point}
+        self.local_sample_count = total_samples
         return cpu_state, total_samples
+
+    def encrypt_for_server(self, aggregator):
+        """
+        直近のfloat項目のみCKKSでチャンク暗号化して返す。
+        戻り値: (enc_float_state, int_buffers_plain, sample_count)
+        """
+        pk = aggregator.get_public_key()
+        cc = aggregator.cc
+        L = aggregator.batch_size
+        enc = {}
+        for name, tensor in self.last_state_floats.items():
+            flat = tensor.numpy().astype(np.float32).ravel()
+            chunks = []
+            for i in range(0, len(flat), L):
+                piece = flat[i:i+L]
+                if len(piece) < L:
+                    piece = np.pad(piece, (0, L - len(piece)), constant_values=0.0)
+                chunks.append(cc.Encrypt(pk, cc.MakeCKKSPackedPlaintext(piece.tolist())))
+            enc[name] = chunks
+        return enc, self.last_int_buffers, self.local_sample_count
 
 
 # =========================================================
@@ -654,20 +582,22 @@ class FHEServer:
         print(f"Global Model - Loss: {avg_loss:.4f}, Accuracy: {accuracy:.2f}%")
         return accuracy, avg_loss
 
-    def aggregate_models_with_fhe(self, client_updates):
+    def aggregate_models_with_fhe(self, enc_payloads):
         """
-        CKKS でクライアント重みを加重平均し、グローバルへ適用。
-        client_updates: list of (state_dict, num_samples) tuples
+        クライアント側暗号化済みペイロードを受け取り、暗号加重平均→復号→適用。
+        enc_payloads: list of (encrypted_float_state, int_buffers_plain, num_samples)
         """
-        print("🔒 FHE-based model aggregation (OpenFHE CKKS)...")
-        # state_dictとサンプル数を分離
-        client_weights_list = [state_dict for state_dict, _ in client_updates]
-        client_sample_counts = [num_samples for _, num_samples in client_updates]
-        aggregated_weights = self.fhe_aggregator.aggregate_encrypted_models(
-            client_weights_list, client_sample_counts
-        )
-        self.global_model.load_state_dict(aggregated_weights)
-        print("🔒 FHE Global model updated with weighted averaging")
+        print("🔒 FHE-based model aggregation (OpenFHE CKKS, client-side encryption)...")
+        agg_float_state, int_buffers = self.fhe_aggregator.aggregate_encrypted_models(enc_payloads)
+        state = self.global_model.state_dict()
+        # float項目（パラメータ＋BN running_mean/var）を更新
+        for name, tensor in agg_float_state.items():
+            state[name] = tensor
+        # 整数バッファは先頭クライアントからコピー
+        for name, tensor in int_buffers.items():
+            state[name] = tensor
+        self.global_model.load_state_dict(state, strict=False)
+        print("🔒 FHE Global model updated (weighted avg for floats, integer buffers copied)")
 
     def get_global_weights(self):
         """クライアントに配布するためのグローバル重みを返す"""
@@ -880,15 +810,15 @@ def run_federated_learning_comparison(
         round_start = time.time()
 
         global_weights = ckks_server.get_global_weights()
-        client_updates = []
+        enc_payloads = []
 
         for client in ckks_clients:
             print(f"\n--- Client {client.client_id} Local Update ---")
             state_dict, num_samples = client.local_update(global_weights, epochs=local_epochs)
-            client_updates.append((state_dict, num_samples))
+            enc_payloads.append(client.encrypt_for_server(ckks_server.fhe_aggregator))
 
         print(f"\n--- 🔒 CKKS Server Aggregation ---")
-        ckks_server.aggregate_models_with_fhe(client_updates)
+        ckks_server.aggregate_models_with_fhe(enc_payloads)
 
         round_end = time.time()
         round_time = round_end - round_start
