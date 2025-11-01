@@ -93,8 +93,10 @@ class FHEModelAggregator:
         mult_depth: int = 1,           # 乗算深度（加算と定数乗算のみなので1で十分）
         scale_mod_size: int = 50,      # スケーリング係数のビット数（精度に影響）
         security_level: SecurityLevel = SecurityLevel.HEStd_128_classic,  # セキュリティレベル
+        bn_mode: str = 'fedavg',       # 'fedavg' or 'fedbn'
     ):
         self.num_clients = num_clients
+        self.bn_mode = bn_mode
 
         # ========================================
         # ステップ1: モデル構造の解析
@@ -109,6 +111,8 @@ class FHEModelAggregator:
 
         for name, buffer in model_structure.named_buffers():
             if hasattr(buffer, "dtype") and buffer.dtype.is_floating_point:
+                if self.bn_mode == 'fedbn' and (name.endswith('running_mean') or name.endswith('running_var')):
+                    continue  # FedBN: 集約対象から除外
                 self.weight_shapes[name] = buffer.shape
                 max_elems = max(max_elems, int(np.prod(buffer.shape)))
 
@@ -160,13 +164,15 @@ class FHEModelAggregator:
 
     # （サーバ側暗号化APIは廃止：クライアント側で暗号化する）
 
-    def aggregate_encrypted_models(self, enc_payloads):
+    def aggregate_encrypted_models(self, enc_payloads, bn_mode='fedavg'):
         """
         クライアント側で暗号化された重みを暗号領域のまま加重平均し、復号して返す。
 
         enc_payloads: List of tuples (encrypted_state_dict, int_buffers_plain, sample_count)
                       encrypted_state_dict: {name: [Ciphertext,...]}  ※float項目のみ
                       int_buffers_plain: {name: torch.Tensor(int系)}   ※先頭クライアントを採用
+        bn_mode: 'fedavg' or 'fedbn'
+                 'fedbn'の場合、BNのrunning_mean/running_varは集約せず先頭クライアントの値を使用
 
         Returns:
             aggregated_weights: {name: torch.Tensor(float32)}（floatパラメータ＋floatバッファ）
@@ -183,6 +189,7 @@ class FHEModelAggregator:
         first_int_buffers = enc_payloads[0][1]
 
         for name, shape in self.weight_shapes.items():
+            # weight_shapes には既に running_* が入っていない（FedBN時）
             num_elems = int(np.prod(shape))
             num_chunks = ceil(num_elems / self.batch_size)
 
@@ -203,13 +210,13 @@ class FHEModelAggregator:
                 flat_vals.extend(vals)
                 self.decrypt_calls += 1
 
-            trimmed = np.array(flat_vals[:num_elems], dtype=np.float32).reshape(tuple(shape))
+            trimmed = np.array(flat_vals[:num_elems], dtype=np.float64).reshape(tuple(shape))
             aggregated_weights[name] = torch.from_numpy(trimmed)
 
         # 期待復号回数チェック（per-chunk）
         expected = sum(ceil(int(np.prod(s)) / self.batch_size) for s in self.weight_shapes.values())
         assert self.decrypt_calls == expected, f"decrypt_calls={self.decrypt_calls} != expected={expected}"
-        print(f"[CKKS] decrypt_calls={self.decrypt_calls} (per-chunk)")
+        print(f"[CKKS] decrypt_calls={self.decrypt_calls} (per-chunk, bn_mode={bn_mode})")
         return aggregated_weights, first_int_buffers
 
 
@@ -434,8 +441,10 @@ class Client:
         self.last_state_floats = None   # {name: Tensor(float)}
         self.last_int_buffers = None    # {name: Tensor(int)}
         self.local_sample_count = 0
+        # FedBN: ラウンド間で各クライアントが自分のBN統計を保持するため
+        self.prev_bn_stats = {}  # {name: Tensor} for running_mean / running_var / num_batches_tracked
 
-    def local_update(self, global_weights, epochs=1):
+    def local_update(self, global_weights, epochs=1, bn_mode='fedavg'):
         """
         ローカル学習を実行
 
@@ -447,6 +456,7 @@ class Client:
         Args:
             global_weights: サーバから受け取ったグローバルモデルの重み
             epochs: ローカル学習のエポック数
+            bn_mode: 'fedavg' or 'fedbn' (現在はクライアント側では未使用)
 
         Returns:
             (cpu_state, total_samples): 学習後の重みとデータ数
@@ -455,7 +465,21 @@ class Client:
 
         # グローバルモデルの重みで初期化
         model = SimpleCIFARNet().to(self.device)
-        model.load_state_dict(global_weights)
+        if bn_mode == 'fedbn':
+            # FedBN: running_mean/running_var はロードせず、各クライアントが独自の統計量を保持
+            filtered = {k: v for k, v in global_weights.items()
+                        if not (k.endswith('running_mean') or k.endswith('running_var'))}
+            model.load_state_dict(filtered, strict=False)
+            # ★ 前ラウンドの自分のBN統計を復元（保持→復元）
+            if self.prev_bn_stats:
+                with torch.no_grad():
+                    msd = model.state_dict()
+                    for k, v in self.prev_bn_stats.items():
+                        if k in msd:
+                            msd[k].copy_(v.to(msd[k].dtype))
+                    model.load_state_dict(msd, strict=False)
+        else:
+            model.load_state_dict(global_weights)
         model.train()  # 訓練モード
 
         # オプティマイザ（SGD: 確率的勾配降下法）
@@ -502,6 +526,14 @@ class Client:
         self.last_state_floats = {k: t for k, t in cpu_state.items() if t.dtype.is_floating_point}
         self.last_int_buffers  = {k: t for k, t in cpu_state.items() if not t.dtype.is_floating_point}
         self.local_sample_count = total_samples
+
+        # ★ FedBN: 次ラウンド用に自分のBN統計を保持
+        if bn_mode == 'fedbn':
+            self.prev_bn_stats = {
+                k: t.clone()
+                for k, t in cpu_state.items()
+                if (k.endswith('running_mean') or k.endswith('running_var') or k.endswith('num_batches_tracked'))
+            }
         return cpu_state, total_samples
 
     def encrypt_for_server(self, aggregator):
@@ -513,8 +545,10 @@ class Client:
         cc = aggregator.cc
         L = aggregator.batch_size
         enc = {}
-        for name, tensor in self.last_state_floats.items():
-            flat = tensor.numpy().astype(np.float32).ravel()
+        # aggregator.weight_shapes は「集約対象の float 項目」だけ（FedBNなら running_* を含まない）
+        for name in aggregator.weight_shapes.keys():
+            tensor = self.last_state_floats[name]
+            flat = tensor.numpy().astype(np.float64).ravel()
             chunks = []
             for i in range(0, len(flat), L):
                 piece = flat[i:i+L]
@@ -546,17 +580,19 @@ class FHEServer:
        d. グローバルモデルを更新
        e. テストデータで評価
     """
-    def __init__(self, num_clients, test_loader, device):
+    def __init__(self, num_clients, test_loader, device, bn_mode='fedavg'):
         self.num_clients = num_clients
         self.device = device
         self.global_model = SimpleCIFARNet().to(self.device)
+        self.bn_mode = bn_mode
 
         # [REPLACED WITH OPENFHE-CKKS] ここで CKKS 版の Aggregator を使用
         self.fhe_aggregator = FHEModelAggregator(
             self.global_model,
             num_clients=num_clients,
             scale_factor=100,   # 引数互換のため受け渡しはするが、CKKS 版では未使用
-            max_value=50        # 同上
+            max_value=50,       # 同上
+            bn_mode=bn_mode
         )
 
         self.test_loader = test_loader
@@ -582,13 +618,14 @@ class FHEServer:
         print(f"Global Model - Loss: {avg_loss:.4f}, Accuracy: {accuracy:.2f}%")
         return accuracy, avg_loss
 
-    def aggregate_models_with_fhe(self, enc_payloads):
+    def aggregate_models_with_fhe(self, enc_payloads, bn_mode='fedavg'):
         """
         クライアント側暗号化済みペイロードを受け取り、暗号加重平均→復号→適用。
         enc_payloads: list of (encrypted_float_state, int_buffers_plain, num_samples)
+        bn_mode: 'fedavg' or 'fedbn'
         """
         print("🔒 FHE-based model aggregation (OpenFHE CKKS, client-side encryption)...")
-        agg_float_state, int_buffers = self.fhe_aggregator.aggregate_encrypted_models(enc_payloads)
+        agg_float_state, int_buffers = self.fhe_aggregator.aggregate_encrypted_models(enc_payloads, bn_mode=bn_mode)
         state = self.global_model.state_dict()
         # float項目（パラメータ＋BN running_mean/var）を更新
         for name, tensor in agg_float_state.items():
@@ -597,7 +634,7 @@ class FHEServer:
         for name, tensor in int_buffers.items():
             state[name] = tensor
         self.global_model.load_state_dict(state, strict=False)
-        print("🔒 FHE Global model updated (weighted avg for floats, integer buffers copied)")
+        print(f"🔒 FHE Global model updated (weighted avg for floats, integer buffers copied, bn_mode={bn_mode})")
 
     def get_global_weights(self):
         """クライアントに配布するためのグローバル重みを返す"""
@@ -640,31 +677,37 @@ class PlainServer:
         print(f"Global Model - Loss: {avg_loss:.4f}, Accuracy: {accuracy:.2f}%")
         return accuracy, avg_loss
 
-    def aggregate_models_plain(self, client_updates):
+    def aggregate_models_plain(self, client_updates, bn_mode='fedavg'):
         """
         平文でクライアント重みを平均し、グローバルへ適用。
         client_updates: list of (state_dict, num_samples) tuples
+        bn_mode: 'fedavg' or 'fedbn'
         """
-        print("📊 Plain model aggregation (weighted averaging)...")
+        print(f"📊 Plain model aggregation (weighted averaging, bn_mode={bn_mode})...")
 
         # サンプル数による加重平均
         total_samples = sum(num_samples for _, num_samples in client_updates)
         aggregated_weights = {}
 
-        for layer_name in client_updates[0][0].keys():
+        state0 = client_updates[0][0]
+        for layer_name in state0.keys():
+            if bn_mode == 'fedbn' and (layer_name.endswith('running_mean') or layer_name.endswith('running_var')):
+                # 触らない（現グローバルの値を保つ）
+                aggregated_weights[layer_name] = self.global_model.state_dict()[layer_name]
+                continue
             # 整数型のバッファ（num_batches_trackedなど）はスキップ
-            if client_updates[0][0][layer_name].dtype in [torch.int32, torch.int64, torch.long]:
-                aggregated_weights[layer_name] = client_updates[0][0][layer_name].clone()
+            if state0[layer_name].dtype in [torch.int32, torch.int64, torch.long]:
+                aggregated_weights[layer_name] = state0[layer_name].clone()
             else:
                 # 加重平均を計算
-                weighted_sum = torch.zeros_like(client_updates[0][0][layer_name])
+                weighted_sum = torch.zeros_like(state0[layer_name])
                 for state_dict, num_samples in client_updates:
                     weight = num_samples / total_samples
                     weighted_sum += state_dict[layer_name] * weight
                 aggregated_weights[layer_name] = weighted_sum
 
         self.global_model.load_state_dict(aggregated_weights)
-        print("📊 Plain Global model updated")
+        print(f"📊 Plain Global model updated (bn_mode={bn_mode})")
 
     def get_global_weights(self):
         """クライアントに配布するためのグローバル重みを返す"""
@@ -683,7 +726,8 @@ def run_federated_learning_comparison(
     iid=True,
     alpha=0.5,
     seed=42,
-    data_dir='./data'
+    data_dir='./data',
+    bn_mode='fedavg'
 ):
     """
     平文とCKKS暗号化の連合学習を実行し、精度と時間を比較
@@ -760,11 +804,11 @@ def run_federated_learning_comparison(
 
         for client in plain_clients:
             print(f"\n--- Client {client.client_id} Local Update ---")
-            state_dict, num_samples = client.local_update(global_weights, epochs=local_epochs)
+            state_dict, num_samples = client.local_update(global_weights, epochs=local_epochs, bn_mode=bn_mode)
             client_updates.append((state_dict, num_samples))
 
         print(f"\n--- 📊 Plain Server Aggregation ---")
-        plain_server.aggregate_models_plain(client_updates)
+        plain_server.aggregate_models_plain(client_updates, bn_mode=bn_mode)
 
         round_end = time.time()
         round_time = round_end - round_start
@@ -786,7 +830,7 @@ def run_federated_learning_comparison(
 
     # 鍵生成時間を計測
     key_gen_start = time.time()
-    ckks_server = FHEServer(num_clients=num_clients, test_loader=test_loader, device=device)
+    ckks_server = FHEServer(num_clients=num_clients, test_loader=test_loader, device=device, bn_mode=bn_mode)
     key_gen_end = time.time()
     key_gen_time = key_gen_end - key_gen_start
     results['ckks']['key_gen_time'] = key_gen_time
@@ -814,11 +858,11 @@ def run_federated_learning_comparison(
 
         for client in ckks_clients:
             print(f"\n--- Client {client.client_id} Local Update ---")
-            state_dict, num_samples = client.local_update(global_weights, epochs=local_epochs)
+            state_dict, num_samples = client.local_update(global_weights, epochs=local_epochs, bn_mode=bn_mode)
             enc_payloads.append(client.encrypt_for_server(ckks_server.fhe_aggregator))
 
         print(f"\n--- 🔒 CKKS Server Aggregation ---")
-        ckks_server.aggregate_models_with_fhe(enc_payloads)
+        ckks_server.aggregate_models_with_fhe(enc_payloads, bn_mode=bn_mode)
 
         round_end = time.time()
         round_time = round_end - round_start
@@ -1129,6 +1173,8 @@ def main():
     parser.add_argument('--alpha', type=float, default=0.5, help='Dirichlet alpha for non-IID (default: 0.5)')
     parser.add_argument('--seed', type=int, default=42, help='Random seed (default: 42)')
     parser.add_argument('--data-dir', type=str, default='./data', help='Data directory (default: ./data)')
+    parser.add_argument('--bn-mode', choices=['fedavg', 'fedbn'], default='fedavg',
+                        help='fedbn で BN の running_mean/var を集約から除外（各クライアントに保持）')
 
     args = parser.parse_args()
 
@@ -1146,7 +1192,8 @@ def main():
         iid=args.iid,
         alpha=args.alpha,
         seed=args.seed,
-        data_dir=args.data_dir
+        data_dir=args.data_dir,
+        bn_mode=args.bn_mode
     )
 
     # 結果のサマリーを出力
