@@ -879,7 +879,7 @@ def run_federated_learning_comparison(
     return results, {'plain': plain_server, 'ckks': ckks_server}
 
 
-def plot_comparison_results(results, num_rounds, num_clients):
+def plot_comparison_results(results, num_rounds, num_clients, bn_mode='fedavg'):
     """
     比較結果をグラフ化して保存
     """
@@ -936,7 +936,7 @@ def plot_comparison_results(results, num_rounds, num_clients):
     plt.tight_layout()
 
     # グラフを保存
-    output_file = f'federated_learning_comparison_clients{num_clients}_rounds{num_rounds}.png'
+    output_file = f'federated_learning_comparison_{bn_mode}_clients{num_clients}_rounds{num_rounds}.png'
     plt.savefig(output_file, dpi=150, bbox_inches='tight')
     print(f"\n📊 Comparison graph saved to: {output_file}")
 
@@ -1165,7 +1165,7 @@ def main():
         description='Federated Learning Comparison: Plain vs CKKS Encrypted with CIFAR-10'
     )
     parser.add_argument('--clients', type=int, default=10, help='Number of clients (default: 10)')
-    parser.add_argument('--rounds', type=int, default=10, help='Number of federated learning rounds (default: 10)')
+    parser.add_argument('--rounds', type=int, default=5, help='Number of federated learning rounds (default: 5)')
     parser.add_argument('--batch-size', type=int, default=64, help='Batch size (default: 64)')
     parser.add_argument('--local-epochs', type=int, default=1, help='Local epochs per round (default: 1)')
     parser.add_argument('--lr', type=float, default=0.01, help='Learning rate (default: 0.01)')
@@ -1200,7 +1200,7 @@ def main():
     print_comparison_summary(results, args.rounds)
 
     # グラフを作成
-    plot_comparison_results(results, args.rounds, args.clients)
+    plot_comparison_results(results, args.rounds, args.clients, args.bn_mode)
 
     # =========================================================
     # 🎨 視覚的証明: 画像分類が実際に動作していることを証明
@@ -1241,7 +1241,7 @@ def main():
         test_dataset,
         device,
         num_samples=16,
-        output_file=f'sample_predictions_plain_clients{args.clients}.png'
+        output_file=f'sample_predictions_plain_{args.bn_mode}_clients{args.clients}.png'
     )
 
     # 2. 混同行列を生成
@@ -1250,7 +1250,7 @@ def main():
         plain_server_final.global_model,
         test_loader,
         device,
-        output_file=f'confusion_matrix_plain_clients{args.clients}.png'
+        output_file=f'confusion_matrix_plain_{args.bn_mode}_clients{args.clients}.png'
     )
 
     # 3. 詳細な分類レポートを表示
@@ -1275,7 +1275,7 @@ def main():
         test_dataset,
         device,
         num_samples=16,
-        output_file=f'sample_predictions_ckks_clients{args.clients}.png'
+        output_file=f'sample_predictions_ckks_{args.bn_mode}_clients{args.clients}.png'
     )
 
     # 2. 混同行列を生成
@@ -1284,7 +1284,7 @@ def main():
         ckks_server_final.global_model,
         test_loader,
         device,
-        output_file=f'confusion_matrix_ckks_clients{args.clients}.png'
+        output_file=f'confusion_matrix_ckks_{args.bn_mode}_clients{args.clients}.png'
     )
 
     # 3. 詳細な分類レポートを表示
@@ -1295,11 +1295,11 @@ def main():
     print("✅ Visual proof completed for both Plain and CKKS!")
     print("="*80)
     print("\n📄 Generated files:")
-    print(f"  1. federated_learning_comparison_clients{args.clients}_rounds{args.rounds}.png")
-    print(f"  2. sample_predictions_plain_clients{args.clients}.png")
-    print(f"  3. confusion_matrix_plain_clients{args.clients}.png")
-    print(f"  4. sample_predictions_ckks_clients{args.clients}.png")
-    print(f"  5. confusion_matrix_ckks_clients{args.clients}.png")
+    print(f"  1. federated_learning_comparison_{args.bn_mode}_clients{args.clients}_rounds{args.rounds}.png")
+    print(f"  2. sample_predictions_plain_{args.bn_mode}_clients{args.clients}.png")
+    print(f"  3. confusion_matrix_plain_{args.bn_mode}_clients{args.clients}.png")
+    print(f"  4. sample_predictions_ckks_{args.bn_mode}_clients{args.clients}.png")
+    print(f"  5. confusion_matrix_ckks_{args.bn_mode}_clients{args.clients}.png")
     print("\nThese visualizations prove that real image classification is being performed,")
     print("and allow comparison between Plain and CKKS encrypted federated learning!")
 
