@@ -598,8 +598,35 @@ class FHEServer:
         self.test_loader = test_loader
         self.criterion = nn.CrossEntropyLoss()
 
+    def calibrate_bn_stats(self, num_batches=10):
+        """
+        FedBNモード用: テストデータを使ってBN統計量をキャリブレーション
+
+        【重要】FedBNでは各クライアントが独自のBN統計量を保持するため、
+        グローバルモデルのBN統計量は集約されません。評価前にテストデータで
+        BN統計量を更新（キャリブレーション）する必要があります。
+
+        Args:
+            num_batches: キャリブレーションに使用するバッチ数
+        """
+        print(f"🔧 [FedBN] Calibrating BN statistics using {num_batches} batches...")
+        self.global_model.train()  # trainモードでBN統計量を更新
+
+        with torch.no_grad():  # 勾配計算は不要（パラメータは更新しない）
+            for i, (data, _) in enumerate(self.test_loader):
+                if i >= num_batches:
+                    break
+                data = data.to(self.device)
+                _ = self.global_model(data)  # 順伝播のみ実行してBN統計量を更新
+
+        print("✅ [FedBN] BN statistics calibrated!")
+
     def evaluate_global_model(self):
         """サーバでグローバルモデルの精度を評価"""
+        # FedBNモードの場合、評価前にBN統計量をキャリブレーション
+        if self.bn_mode == 'fedbn':
+            self.calibrate_bn_stats(num_batches=10)
+
         self.global_model.eval()
         correct = 0
         total = 0
@@ -650,15 +677,43 @@ class PlainServer:
       - グローバルモデルの保持と評価
       - 平文でのモデル集約（単純平均）
     """
-    def __init__(self, num_clients, test_loader, device):
+    def __init__(self, num_clients, test_loader, device, bn_mode='fedavg'):
         self.num_clients = num_clients
         self.device = device
         self.global_model = SimpleCIFARNet().to(self.device)
         self.test_loader = test_loader
         self.criterion = nn.CrossEntropyLoss()
+        self.bn_mode = bn_mode
+
+    def calibrate_bn_stats(self, num_batches=10):
+        """
+        FedBNモード用: テストデータを使ってBN統計量をキャリブレーション
+
+        【重要】FedBNでは各クライアントが独自のBN統計量を保持するため、
+        グローバルモデルのBN統計量は集約されません。評価前にテストデータで
+        BN統計量を更新（キャリブレーション）する必要があります。
+
+        Args:
+            num_batches: キャリブレーションに使用するバッチ数
+        """
+        print(f"🔧 [FedBN] Calibrating BN statistics using {num_batches} batches...")
+        self.global_model.train()  # trainモードでBN統計量を更新
+
+        with torch.no_grad():  # 勾配計算は不要（パラメータは更新しない）
+            for i, (data, _) in enumerate(self.test_loader):
+                if i >= num_batches:
+                    break
+                data = data.to(self.device)
+                _ = self.global_model(data)  # 順伝播のみ実行してBN統計量を更新
+
+        print("✅ [FedBN] BN statistics calibrated!")
 
     def evaluate_global_model(self):
         """サーバでグローバルモデルの精度を評価"""
+        # FedBNモードの場合、評価前にBN統計量をキャリブレーション
+        if self.bn_mode == 'fedbn':
+            self.calibrate_bn_stats(num_batches=10)
+
         self.global_model.eval()
         correct = 0
         total = 0
@@ -782,7 +837,7 @@ def run_federated_learning_comparison(
     print("📊 PLAIN FEDERATED LEARNING")
     print("="*80)
 
-    plain_server = PlainServer(num_clients=num_clients, test_loader=test_loader, device=device)
+    plain_server = PlainServer(num_clients=num_clients, test_loader=test_loader, device=device, bn_mode=bn_mode)
     plain_clients = [
         Client(client_id=i+1, train_loader=client_loaders[i], device=device, lr=lr)
         for i in range(num_clients)
