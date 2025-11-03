@@ -25,6 +25,7 @@
 import torch
 import torch.nn as nn
 import torch.optim as optim
+from typing import Dict
 from torch.utils.data import DataLoader, Dataset
 import numpy as np
 import threading
@@ -37,6 +38,8 @@ matplotlib.use('Agg')  # GUIなし環境対応
 import argparse
 from sklearn.metrics import confusion_matrix, classification_report
 import seaborn as sns
+import os
+from datetime import datetime
 
 # [OPENFHE-CKKS] 追加
 from openfhe import *
@@ -53,6 +56,26 @@ def _next_pow2(n: int) -> int:
     例: n=100 → 128, n=1000 → 1024
     """
     return 1 << ceil(log2(max(1, n)))
+
+
+def create_output_directory(model_name: str, num_clients: int, num_rounds: int) -> str:
+    """
+    実験結果を保存するディレクトリを作成
+
+    Args:
+        model_name: モデル名（server_opt + bn_mode）
+        num_clients: クライアント数
+        num_rounds: ラウンド数
+
+    Returns:
+        作成されたディレクトリのパス
+    """
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    dir_name = f"{model_name}_clients{num_clients}_rounds{num_rounds}_{timestamp}"
+    output_dir = os.path.join("out", dir_name)
+    os.makedirs(output_dir, exist_ok=True)
+    print(f"📁 Output directory created: {output_dir}")
+    return output_dir
 
 
 # =========================================================
@@ -211,7 +234,7 @@ class FHEModelAggregator:
                 self.decrypt_calls += 1
 
             trimmed = np.array(flat_vals[:num_elems], dtype=np.float64).reshape(tuple(shape))
-            aggregated_weights[name] = torch.from_numpy(trimmed)
+            aggregated_weights[name] = torch.from_numpy(trimmed).float()  # float32に変換
 
         # 期待復号回数チェック（per-chunk）
         expected = sum(ceil(int(np.prod(s)) / self.batch_size) for s in self.weight_shapes.values())
@@ -580,11 +603,28 @@ class FHEServer:
        d. グローバルモデルを更新
        e. テストデータで評価
     """
-    def __init__(self, num_clients, test_loader, device, bn_mode='fedavg'):
+    def __init__(self, num_clients, test_loader, device, bn_mode='fedavg',
+                 server_opt: str = 'fedavg',
+                 server_lr: float = 1.0,
+                 server_mu: float = 0.0,
+                 server_beta1: float = 0.9,
+                 server_beta2: float = 0.999,
+                 server_eps: float = 1e-8):
         self.num_clients = num_clients
         self.device = device
         self.global_model = SimpleCIFARNet().to(self.device)
         self.bn_mode = bn_mode
+        # --- FedOpt 系のサーバ最適化設定 ---
+        self.server_opt = server_opt.lower()
+        self.server_lr = float(server_lr)
+        self.server_mu = float(server_mu)
+        self.server_beta1 = float(server_beta1)
+        self.server_beta2 = float(server_beta2)
+        self.server_eps = float(server_eps)
+        self._server_momentum: Dict[str, torch.Tensor] = {}   # FedAvgM 用
+        self._server_m: Dict[str, torch.Tensor] = {}          # FedAdam 一次モーメント
+        self._server_v: Dict[str, torch.Tensor] = {}          # FedAdam 二次モーメント
+        self._server_step: int = 0                            # FedAdam bias correction
 
         # [REPLACED WITH OPENFHE-CKKS] ここで CKKS 版の Aggregator を使用
         self.fhe_aggregator = FHEModelAggregator(
@@ -597,6 +637,91 @@ class FHEServer:
 
         self.test_loader = test_loader
         self.criterion = nn.CrossEntropyLoss()
+
+    # ===============================
+    # サーバ側最適化: 共通ヘルパ
+    # ===============================
+    def _apply_server_update(self, w_avg_map: Dict[str, torch.Tensor], state: Dict[str, torch.Tensor]) -> Dict[str, torch.Tensor]:
+        """
+        w_avg_map:  各パラメータ名 → クライアント平均（float項目のみ）
+        state:      現在のグローバル state_dict()
+        戻り値:     更新後の float パラメータだけを返す
+        """
+        opt = self.server_opt
+        if opt == 'fedavg':
+            # そのまま平均を採用
+            return {k: v.to(dtype=state[k].dtype, device=state[k].device) for k, v in w_avg_map.items()}
+        elif opt == 'fedavgm':
+            return self._apply_server_momentum(w_avg_map, state)
+        elif opt == 'fedadam':
+            return self._apply_server_adam(w_avg_map, state)
+        else:
+            print(f"⚠️ Unknown server_opt={opt}. Falling back to FedAvg.")
+            return {k: v.to(dtype=state[k].dtype, device=state[k].device) for k, v in w_avg_map.items()}
+
+    def _ensure_momentum_buffers(self, state: Dict[str, torch.Tensor]):
+        if self._server_momentum:
+            return
+        for name, w in state.items():
+            if not w.dtype.is_floating_point:
+                continue
+            self._server_momentum[name] = torch.zeros_like(w)
+
+    def _apply_server_momentum(self, w_avg_map: Dict[str, torch.Tensor], state: Dict[str, torch.Tensor]) -> Dict[str, torch.Tensor]:
+        """FedAvgM: v_t = μ v_{t-1} + (w_avg - w_old);  w_new = w_old + η v_t"""
+        self._ensure_momentum_buffers(state)
+        updated: Dict[str, torch.Tensor] = {}
+        for name, w_avg in w_avg_map.items():
+            w_old = state[name]
+            v = self._server_momentum[name].to(w_old.device, dtype=w_old.dtype)
+            delta = (w_avg.to(w_old.device, dtype=w_old.dtype) - w_old)
+            v = self.server_mu * v + delta
+            w_new = w_old + self.server_lr * v
+            self._server_momentum[name] = v.detach()
+            updated[name] = w_new.detach()
+        return updated
+
+    def _ensure_adam_buffers(self, state: Dict[str, torch.Tensor]):
+        if self._server_m and self._server_v:
+            return
+        for name, w in state.items():
+            if not w.dtype.is_floating_point:
+                continue
+            self._server_m[name] = torch.zeros_like(w)
+            self._server_v[name] = torch.zeros_like(w)
+        self._server_step = 0
+
+    def _apply_server_adam(self, w_avg_map: Dict[str, torch.Tensor], state: Dict[str, torch.Tensor]) -> Dict[str, torch.Tensor]:
+        """
+        FedAdam（FedOpt）:
+          g_t = w_old - w_avg   （サーバでの擬似"勾配"）
+          m_t = β1 m_{t-1} + (1-β1) g_t
+          v_t = β2 v_{t-1} + (1-β2) g_t^2
+          m_hat = m_t / (1-β1^t),  v_hat = v_t / (1-β2^t)
+          w_new = w_old - η * m_hat / (sqrt(v_hat) + ε)
+        """
+        self._ensure_adam_buffers(state)
+        self._server_step += 1
+        b1, b2, eps, lr = self.server_beta1, self.server_beta2, self.server_eps, self.server_lr
+        updated: Dict[str, torch.Tensor] = {}
+        # bias correction
+        bias_c1 = 1.0 - (b1 ** self._server_step)
+        bias_c2 = 1.0 - (b2 ** self._server_step)
+        for name, w_avg in w_avg_map.items():
+            w_old = state[name]
+            m = self._server_m[name].to(w_old.device, dtype=w_old.dtype)
+            v = self._server_v[name].to(w_old.device, dtype=w_old.dtype)
+            # 注意: w_old - w_avg とすることで、「平均へ近づく」方向に降下
+            g = (w_old - w_avg.to(w_old.device, dtype=w_old.dtype))
+            m = b1 * m + (1.0 - b1) * g
+            v = b2 * v + (1.0 - b2) * (g * g)
+            m_hat = m / max(bias_c1, 1e-8)
+            v_hat = v / max(bias_c2, 1e-8)
+            w_new = w_old - lr * m_hat / (torch.sqrt(v_hat) + eps)
+            self._server_m[name] = m.detach()
+            self._server_v[name] = v.detach()
+            updated[name] = w_new.detach()
+        return updated
 
     def calibrate_bn_stats(self, num_batches=10):
         """
@@ -654,14 +779,24 @@ class FHEServer:
         print("🔒 FHE-based model aggregation (OpenFHE CKKS, client-side encryption)...")
         agg_float_state, int_buffers = self.fhe_aggregator.aggregate_encrypted_models(enc_payloads, bn_mode=bn_mode)
         state = self.global_model.state_dict()
-        # float項目（パラメータ＋BN running_mean/var）を更新
-        for name, tensor in agg_float_state.items():
+        # BN 統計を分離
+        w_avg_params = {k: v for k, v in agg_float_state.items()
+                        if not (k.endswith('running_mean') or k.endswith('running_var'))}
+        bn_avg_map   = {k: v for k, v in agg_float_state.items()
+                        if     (k.endswith('running_mean') or k.endswith('running_var'))}
+        # サーバ最適化子は学習可能パラメータのみ
+        updated_params = self._apply_server_update(w_avg_params, state)
+        # 反映
+        for name, tensor in updated_params.items():
             state[name] = tensor
-        # 整数バッファは先頭クライアントからコピー
+        # BN 統計は平均値をそのまま設定
+        for name, tensor in bn_avg_map.items():
+            state[name] = tensor
+        # 整数バッファは先頭クライアントからコピー（num_batches_tracked 等）
         for name, tensor in int_buffers.items():
             state[name] = tensor
         self.global_model.load_state_dict(state, strict=False)
-        print(f"🔒 FHE Global model updated (weighted avg for floats, integer buffers copied, bn_mode={bn_mode})")
+        print(f"🔒 FHE Global model updated (server_opt={self.server_opt}, bn_mode={bn_mode})")
 
     def get_global_weights(self):
         """クライアントに配布するためのグローバル重みを返す"""
@@ -677,13 +812,98 @@ class PlainServer:
       - グローバルモデルの保持と評価
       - 平文でのモデル集約（単純平均）
     """
-    def __init__(self, num_clients, test_loader, device, bn_mode='fedavg'):
+    def __init__(self, num_clients, test_loader, device, bn_mode='fedavg',
+                 server_opt: str = 'fedavg',
+                 server_lr: float = 1.0,
+                 server_mu: float = 0.0,
+                 server_beta1: float = 0.9,
+                 server_beta2: float = 0.999,
+                 server_eps: float = 1e-8):
         self.num_clients = num_clients
         self.device = device
         self.global_model = SimpleCIFARNet().to(self.device)
         self.test_loader = test_loader
         self.criterion = nn.CrossEntropyLoss()
         self.bn_mode = bn_mode
+        # --- FedOpt 系のサーバ最適化設定 ---
+        self.server_opt = server_opt.lower()
+        self.server_lr = float(server_lr)
+        self.server_mu = float(server_mu)
+        self.server_beta1 = float(server_beta1)
+        self.server_beta2 = float(server_beta2)
+        self.server_eps = float(server_eps)
+        self._server_momentum: Dict[str, torch.Tensor] = {}   # FedAvgM
+        self._server_m: Dict[str, torch.Tensor] = {}          # FedAdam
+        self._server_v: Dict[str, torch.Tensor] = {}          # FedAdam
+        self._server_step: int = 0
+
+    # ===============================
+    # サーバ側最適化: 共通ヘルパ（FHEServerと同一実装）
+    # ===============================
+    def _apply_server_update(self, w_avg_map: Dict[str, torch.Tensor], state: Dict[str, torch.Tensor]) -> Dict[str, torch.Tensor]:
+        opt = self.server_opt
+        if opt == 'fedavg':
+            return {k: v.to(dtype=state[k].dtype, device=state[k].device) for k, v in w_avg_map.items()}
+        elif opt == 'fedavgm':
+            return self._apply_server_momentum(w_avg_map, state)
+        elif opt == 'fedadam':
+            return self._apply_server_adam(w_avg_map, state)
+        else:
+            print(f"⚠️ Unknown server_opt={opt}. Falling back to FedAvg.")
+            return {k: v.to(dtype=state[k].dtype, device=state[k].device) for k, v in w_avg_map.items()}
+
+    def _ensure_momentum_buffers(self, state: Dict[str, torch.Tensor]):
+        if self._server_momentum:
+            return
+        for name, w in state.items():
+            if not w.dtype.is_floating_point:
+                continue
+            self._server_momentum[name] = torch.zeros_like(w)
+
+    def _apply_server_momentum(self, w_avg_map: Dict[str, torch.Tensor], state: Dict[str, torch.Tensor]) -> Dict[str, torch.Tensor]:
+        self._ensure_momentum_buffers(state)
+        updated: Dict[str, torch.Tensor] = {}
+        for name, w_avg in w_avg_map.items():
+            w_old = state[name]
+            v = self._server_momentum[name].to(w_old.device, dtype=w_old.dtype)
+            delta = (w_avg.to(w_old.device, dtype=w_old.dtype) - w_old)
+            v = self.server_mu * v + delta
+            w_new = w_old + self.server_lr * v
+            self._server_momentum[name] = v.detach()
+            updated[name] = w_new.detach()
+        return updated
+
+    def _ensure_adam_buffers(self, state: Dict[str, torch.Tensor]):
+        if self._server_m and self._server_v:
+            return
+        for name, w in state.items():
+            if not w.dtype.is_floating_point:
+                continue
+            self._server_m[name] = torch.zeros_like(w)
+            self._server_v[name] = torch.zeros_like(w)
+        self._server_step = 0
+
+    def _apply_server_adam(self, w_avg_map: Dict[str, torch.Tensor], state: Dict[str, torch.Tensor]) -> Dict[str, torch.Tensor]:
+        self._ensure_adam_buffers(state)
+        self._server_step += 1
+        b1, b2, eps, lr = self.server_beta1, self.server_beta2, self.server_eps, self.server_lr
+        updated: Dict[str, torch.Tensor] = {}
+        bias_c1 = 1.0 - (b1 ** self._server_step)
+        bias_c2 = 1.0 - (b2 ** self._server_step)
+        for name, w_avg in w_avg_map.items():
+            w_old = state[name]
+            m = self._server_m[name].to(w_old.device, dtype=w_old.dtype)
+            v = self._server_v[name].to(w_old.device, dtype=w_old.dtype)
+            g = (w_old - w_avg.to(w_old.device, dtype=w_old.dtype))
+            m = b1 * m + (1.0 - b1) * g
+            v = b2 * v + (1.0 - b2) * (g * g)
+            m_hat = m / max(bias_c1, 1e-8)
+            v_hat = v / max(bias_c2, 1e-8)
+            w_new = w_old - lr * m_hat / (torch.sqrt(v_hat) + eps)
+            self._server_m[name] = m.detach()
+            self._server_v[name] = v.detach()
+            updated[name] = w_new.detach()
+        return updated
 
     def calibrate_bn_stats(self, num_batches=10):
         """
@@ -739,30 +959,41 @@ class PlainServer:
         bn_mode: 'fedavg' or 'fedbn'
         """
         print(f"📊 Plain model aggregation (weighted averaging, bn_mode={bn_mode})...")
-
+        state = self.global_model.state_dict()
         # サンプル数による加重平均
         total_samples = sum(num_samples for _, num_samples in client_updates)
-        aggregated_weights = {}
-
         state0 = client_updates[0][0]
-        for layer_name in state0.keys():
-            if bn_mode == 'fedbn' and (layer_name.endswith('running_mean') or layer_name.endswith('running_var')):
-                # 触らない（現グローバルの値を保つ）
-                aggregated_weights[layer_name] = self.global_model.state_dict()[layer_name]
+        w_avg_params: Dict[str, torch.Tensor] = {}   # ← 最適化子に渡す（学習可能パラメータ等）
+        bn_avg_map: Dict[str, torch.Tensor] = {}     # ← running_mean/var は直接代入
+        int_buffers: Dict[str, torch.Tensor] = {}
+        for name, tensor0 in state0.items():
+            # FedBN の場合、BN running_* は除外
+            if bn_mode == 'fedbn' and (name.endswith('running_mean') or name.endswith('running_var')):
                 continue
-            # 整数型のバッファ（num_batches_trackedなど）はスキップ
-            if state0[layer_name].dtype in [torch.int32, torch.int64, torch.long]:
-                aggregated_weights[layer_name] = state0[layer_name].clone()
+            if tensor0.dtype in [torch.int32, torch.int64, torch.long]:
+                int_buffers[name] = tensor0.clone()
             else:
-                # 加重平均を計算
-                weighted_sum = torch.zeros_like(state0[layer_name])
-                for state_dict, num_samples in client_updates:
-                    weight = num_samples / total_samples
-                    weighted_sum += state_dict[layer_name] * weight
-                aggregated_weights[layer_name] = weighted_sum
-
-        self.global_model.load_state_dict(aggregated_weights)
-        print(f"📊 Plain Global model updated (bn_mode={bn_mode})")
+                ws = torch.zeros_like(tensor0)
+                for sd, n in client_updates:
+                    ws += sd[name] * (n / total_samples)
+                if name.endswith('running_mean') or name.endswith('running_var'):
+                    # ★ BN統計は直接代入（最適化しない）
+                    bn_avg_map[name] = ws
+                else:
+                    w_avg_params[name] = ws
+        # サーバ最適化子の適用（学習可能パラメータのみ）
+        updated_params = self._apply_server_update(w_avg_params, state)
+        # 反映
+        for name, tensor in updated_params.items():
+            state[name] = tensor
+        # BN 統計は平均値をそのまま設定
+        for name, tensor in bn_avg_map.items():
+            state[name] = tensor
+        # BN の running_*（fedbn時）はそのまま、整数バッファは代表をコピー
+        for name, tensor in int_buffers.items():
+            state[name] = tensor
+        self.global_model.load_state_dict(state, strict=False)
+        print(f"📊 Plain Global model updated (server_opt={self.server_opt}, bn_mode={bn_mode})")
 
     def get_global_weights(self):
         """クライアントに配布するためのグローバル重みを返す"""
@@ -782,7 +1013,13 @@ def run_federated_learning_comparison(
     alpha=0.5,
     seed=42,
     data_dir='./data',
-    bn_mode='fedavg'
+    bn_mode='fedavg',
+    server_opt='fedavg',
+    server_lr=0.01,
+    server_mu=0.0,
+    server_beta1=0.9,
+    server_beta2=0.999,
+    server_eps=1e-8
 ):
     """
     平文とCKKS暗号化の連合学習を実行し、精度と時間を比較
@@ -837,7 +1074,10 @@ def run_federated_learning_comparison(
     print("📊 PLAIN FEDERATED LEARNING")
     print("="*80)
 
-    plain_server = PlainServer(num_clients=num_clients, test_loader=test_loader, device=device, bn_mode=bn_mode)
+    plain_server = PlainServer(num_clients=num_clients, test_loader=test_loader, device=device,
+                               bn_mode=bn_mode,
+                               server_opt=server_opt, server_lr=server_lr, server_mu=server_mu,
+                               server_beta1=server_beta1, server_beta2=server_beta2, server_eps=server_eps)
     plain_clients = [
         Client(client_id=i+1, train_loader=client_loaders[i], device=device, lr=lr)
         for i in range(num_clients)
@@ -885,7 +1125,9 @@ def run_federated_learning_comparison(
 
     # 鍵生成時間を計測
     key_gen_start = time.time()
-    ckks_server = FHEServer(num_clients=num_clients, test_loader=test_loader, device=device, bn_mode=bn_mode)
+    ckks_server = FHEServer(num_clients=num_clients, test_loader=test_loader, device=device, bn_mode=bn_mode,
+                            server_opt=server_opt, server_lr=server_lr, server_mu=server_mu,
+                            server_beta1=server_beta1, server_beta2=server_beta2, server_eps=server_eps)
     key_gen_end = time.time()
     key_gen_time = key_gen_end - key_gen_start
     results['ckks']['key_gen_time'] = key_gen_time
@@ -934,9 +1176,14 @@ def run_federated_learning_comparison(
     return results, {'plain': plain_server, 'ckks': ckks_server}
 
 
-def plot_comparison_results(results, num_rounds, num_clients, bn_mode='fedavg'):
+def plot_comparison_results(results, num_rounds, output_dir):
     """
     比較結果をグラフ化して保存
+
+    Args:
+        results: 実験結果の辞書
+        num_rounds: ラウンド数
+        output_dir: 出力ディレクトリのパス
     """
     key_gen_time = results['ckks']['key_gen_time']
 
@@ -955,6 +1202,7 @@ def plot_comparison_results(results, num_rounds, num_clients, bn_mode='fedavg'):
     ax1.set_xlabel('Round', fontsize=12)
     ax1.set_ylabel('Accuracy (%)', fontsize=12)
     ax1.set_title('Federated Learning Accuracy Comparison: Plain vs CKKS', fontsize=14, fontweight='bold')
+    ax1.set_ylim(0, 100)  # 縦軸を0-100%に統一
     ax1.legend(fontsize=11)
     ax1.grid(True, alpha=0.3)
     ax1.set_xticks(rounds)
@@ -977,6 +1225,11 @@ def plot_comparison_results(results, num_rounds, num_clients, bn_mode='fedavg'):
     ax2.set_xlabel('Round', fontsize=12)
     ax2.set_ylabel('Time (seconds)', fontsize=12)
     ax2.set_title('Federated Learning Execution Time Comparison: Plain vs CKKS', fontsize=14, fontweight='bold')
+
+    # 実行時間の縦軸を適切に設定（最大値の1.2倍）
+    max_time = max(max(results['plain']['time']), max(results['ckks']['time']))
+    ax2.set_ylim(0, max_time * 1.2)
+
     ax2.set_xticks(x)
     ax2.set_xticklabels([f'Round {i}' for i in round_nums])
     ax2.legend(fontsize=11)
@@ -990,8 +1243,8 @@ def plot_comparison_results(results, num_rounds, num_clients, bn_mode='fedavg'):
 
     plt.tight_layout()
 
-    # グラフを保存
-    output_file = f'federated_learning_comparison_{bn_mode}_clients{num_clients}_rounds{num_rounds}.png'
+    # グラフを保存（シンプルな名前）
+    output_file = os.path.join(output_dir, 'comparison.png')
     plt.savefig(output_file, dpi=150, bbox_inches='tight')
     print(f"\n📊 Comparison graph saved to: {output_file}")
 
@@ -1002,7 +1255,7 @@ def plot_comparison_results(results, num_rounds, num_clients, bn_mode='fedavg'):
 # 🎨 視覚的証明: 画像分類が実際に動作していることを証明
 # =========================================================
 
-def visualize_sample_predictions(model, test_dataset, device, num_samples=16, output_file='sample_predictions.png'):
+def visualize_sample_predictions(model, test_dataset, device, output_dir, filename, num_samples=16):
     """
     テストデータからランダムにサンプルを抽出し、予測結果を可視化
 
@@ -1013,8 +1266,9 @@ def visualize_sample_predictions(model, test_dataset, device, num_samples=16, ou
         model: 学習済みモデル
         test_dataset: テストデータセット
         device: 計算デバイス
+        output_dir: 出力ディレクトリのパス
+        filename: 出力ファイル名
         num_samples: 表示するサンプル数
-        output_file: 出力ファイル名
     """
     # CIFAR-10のクラス名
     class_names = ['airplane', 'automobile', 'bird', 'cat', 'deer',
@@ -1060,12 +1314,13 @@ def visualize_sample_predictions(model, test_dataset, device, num_samples=16, ou
         ax.set_title(title, fontsize=9, color=color, fontweight='bold')
 
     plt.tight_layout()
+    output_file = os.path.join(output_dir, filename)
     plt.savefig(output_file, dpi=150, bbox_inches='tight')
     print(f"\n🎨 Sample predictions visualization saved to: {output_file}")
     plt.close()
 
 
-def visualize_confusion_matrix(model, test_loader, device, output_file='confusion_matrix.png'):
+def visualize_confusion_matrix(model, test_loader, device, output_dir, filename):
     """
     混同行列を生成して可視化
 
@@ -1078,7 +1333,8 @@ def visualize_confusion_matrix(model, test_loader, device, output_file='confusio
         model: 学習済みモデル
         test_loader: テストデータローダー
         device: 計算デバイス
-        output_file: 出力ファイル名
+        output_dir: 出力ディレクトリのパス
+        filename: 出力ファイル名
     """
     # CIFAR-10のクラス名
     class_names = ['airplane', 'automobile', 'bird', 'cat', 'deer',
@@ -1113,6 +1369,7 @@ def visualize_confusion_matrix(model, test_loader, device, output_file='confusio
                  fontsize=14, fontweight='bold')
 
     plt.tight_layout()
+    output_file = os.path.join(output_dir, filename)
     plt.savefig(output_file, dpi=150, bbox_inches='tight')
     print(f"✅ Confusion matrix saved to: {output_file}")
     plt.close()
@@ -1230,12 +1487,32 @@ def main():
     parser.add_argument('--data-dir', type=str, default='./data', help='Data directory (default: ./data)')
     parser.add_argument('--bn-mode', choices=['fedavg', 'fedbn'], default='fedavg',
                         help='fedbn で BN の running_mean/var を集約から除外（各クライアントに保持）')
+    # --- サーバ最適化（FedOpt 系） ---
+    parser.add_argument('--server-opt', choices=['fedavg', 'fedavgm', 'fedadam'], default='fedavg',
+                        help='Server optimizer for aggregation (FedAvg/FedAvgM/FedAdam)')
+    parser.add_argument('--server-lr', type=float, default=None,
+                        help='Server learning rate (FedAvg=1.0, FedAvgM/FedAdam=0.01~0.001推奨)')
+    parser.add_argument('--server-mu', type=float, default=None,
+                        help='FedAvgM momentum μ')
+    parser.add_argument('--server-beta1', type=float, default=0.9,
+                        help='FedAdam β1')
+    parser.add_argument('--server-beta2', type=float, default=0.999,
+                        help='FedAdam β2')
+    parser.add_argument('--server-eps', type=float, default=1e-8,
+                        help='FedAdam ε')
 
     args = parser.parse_args()
+
+    # サーバ超パラ 未指定なら合理的既定値に分岐
+    if args.server_lr is None:
+        args.server_lr = 1.0 if args.server_opt in ['fedavg', 'fedavgm'] else 0.01
+    if args.server_mu is None:
+        args.server_mu = 0.9 if args.server_opt == 'fedavgm' else 0.0
 
     print(f"Starting federated learning with {args.clients} clients and {args.rounds} rounds")
     print(f"Batch size: {args.batch_size}, Local epochs: {args.local_epochs}, LR: {args.lr}")
     print(f"Data partitioning: {'IID' if args.iid else f'non-IID (alpha={args.alpha})'}")
+    print(f"Server optimizer: {args.server_opt} (lr={args.server_lr}, mu={args.server_mu})")
 
     # 比較実験を実行
     results, servers = run_federated_learning_comparison(
@@ -1248,14 +1525,30 @@ def main():
         alpha=args.alpha,
         seed=args.seed,
         data_dir=args.data_dir,
-        bn_mode=args.bn_mode
+        bn_mode=args.bn_mode,
+        server_opt=args.server_opt,
+        server_lr=args.server_lr,
+        server_mu=args.server_mu,
+        server_beta1=args.server_beta1,
+        server_beta2=args.server_beta2,
+        server_eps=args.server_eps
     )
 
     # 結果のサマリーを出力
     print_comparison_summary(results, args.rounds)
 
+    # モデル名を構築（server_optとbn_modeを組み合わせ）
+    # server_optをベースにして、bn_modeがfedbnの場合のみ '_bn' を追加
+    if args.bn_mode == 'fedbn':
+        model_name = f'{args.server_opt}_bn'
+    else:
+        model_name = args.server_opt
+
+    # 出力ディレクトリを作成
+    output_dir = create_output_directory(model_name, args.clients, args.rounds)
+
     # グラフを作成
-    plot_comparison_results(results, args.rounds, args.clients, args.bn_mode)
+    plot_comparison_results(results, args.rounds, output_dir)
 
     # =========================================================
     # 🎨 視覚的証明: 画像分類が実際に動作していることを証明
@@ -1295,8 +1588,8 @@ def main():
         plain_server_final.global_model,
         test_dataset,
         device,
-        num_samples=16,
-        output_file=f'sample_predictions_plain_{args.bn_mode}_clients{args.clients}.png'
+        output_dir,
+        'sample_predictions_plain.png'
     )
 
     # 2. 混同行列を生成
@@ -1305,7 +1598,8 @@ def main():
         plain_server_final.global_model,
         test_loader,
         device,
-        output_file=f'confusion_matrix_plain_{args.bn_mode}_clients{args.clients}.png'
+        output_dir,
+        'confusion_matrix_plain.png'
     )
 
     # 3. 詳細な分類レポートを表示
@@ -1329,8 +1623,8 @@ def main():
         ckks_server_final.global_model,
         test_dataset,
         device,
-        num_samples=16,
-        output_file=f'sample_predictions_ckks_{args.bn_mode}_clients{args.clients}.png'
+        output_dir,
+        'sample_predictions_ckks.png'
     )
 
     # 2. 混同行列を生成
@@ -1339,7 +1633,8 @@ def main():
         ckks_server_final.global_model,
         test_loader,
         device,
-        output_file=f'confusion_matrix_ckks_{args.bn_mode}_clients{args.clients}.png'
+        output_dir,
+        'confusion_matrix_ckks.png'
     )
 
     # 3. 詳細な分類レポートを表示
@@ -1349,12 +1644,13 @@ def main():
     print("\n" + "="*80)
     print("✅ Visual proof completed for both Plain and CKKS!")
     print("="*80)
+    print(f"\n📁 All results saved to: {output_dir}")
     print("\n📄 Generated files:")
-    print(f"  1. federated_learning_comparison_{args.bn_mode}_clients{args.clients}_rounds{args.rounds}.png")
-    print(f"  2. sample_predictions_plain_{args.bn_mode}_clients{args.clients}.png")
-    print(f"  3. confusion_matrix_plain_{args.bn_mode}_clients{args.clients}.png")
-    print(f"  4. sample_predictions_ckks_{args.bn_mode}_clients{args.clients}.png")
-    print(f"  5. confusion_matrix_ckks_{args.bn_mode}_clients{args.clients}.png")
+    print(f"  1. comparison.png")
+    print(f"  2. sample_predictions_plain.png")
+    print(f"  3. confusion_matrix_plain.png")
+    print(f"  4. sample_predictions_ckks.png")
+    print(f"  5. confusion_matrix_ckks.png")
     print("\nThese visualizations prove that real image classification is being performed,")
     print("and allow comparison between Plain and CKKS encrypted federated learning!")
 
