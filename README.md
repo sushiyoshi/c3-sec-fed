@@ -116,16 +116,20 @@ python ckks_chebyshev.py
 
 `federated.py`を実行すると以下の5つのグラフが生成される:
 
-### 1. `federated_learning_comparison_{bn_mode}_clients{N}_rounds{R}.png`
+### 1. `federated_learning_comparison_{model_name}_clients{N}_rounds{R}.png`
 平文とCKKS暗号化の全体比較。上段は精度推移（2本の折れ線が重なるほど暗号化による劣化が少ない）、下段は実行時間（CKKS版のオーバーヘッドを示す）。
 
-### 2-3. `sample_predictions_plain/ckks_{bn_mode}_clients{N}.png`
+### 2-3. `sample_predictions_plain/ckks_{model_name}_clients{N}.png`
 ランダムに選んだ16枚の画像とその分類結果。緑=正解、赤=誤分類。ダミー実装でないことの視覚的証明と、平文版とCKKS版の予測傾向の比較に使用。
 
-### 4-5. `confusion_matrix_plain/ckks_{bn_mode}_clients{N}.png`
+### 4-5. `confusion_matrix_plain/ckks_{model_name}_clients{N}.png`
 10x10の混同行列。対角線上の数値が正解数、対角線外が誤分類数。平文版とCKKS版で対角線の値が近ければ暗号化の影響は小さい。特定クラスペアでの誤分類傾向（例: cat→dog）を確認可能。
 
-**注:** `{bn_mode}`は`fedavg`または`fedbn`、`{N}`はクライアント数、`{R}`はラウンド数
+**注:**
+- `{model_name}`はサーバ最適化手法とBNモードを組み合わせたもの:
+  - `fedavg`, `fedavgm`, `fedadam` (bn_mode=fedavg時)
+  - `fedavg_bn`, `fedavgm_bn`, `fedadam_bn` (bn_mode=fedbn時)
+- `{N}`はクライアント数、`{R}`はラウンド数
 
 ## Files
 
